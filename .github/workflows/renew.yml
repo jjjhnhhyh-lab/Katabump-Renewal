@@ -2,12 +2,11 @@ name: Katabump Auto Renew
 
 on:
   schedule:
-    # 每天 UTC 0 点（北京时间 8 点）
     - cron: "0 0 * * *"
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   renew:
@@ -42,31 +41,22 @@ jobs:
           tar -xzf "sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
           mv "sing-box-${SINGBOX_VER}-linux-amd64/sing-box" ./sing-box
           chmod +x ./sing-box
-          echo "Generating sing-box config from PROXY_URL..."
           python proxy_handler.py
-          echo "Starting sing-box..."
           nohup ./sing-box run -c config.json > singbox.log 2>&1 &
           sleep 24
-          echo "--- singbox.log ---"
-          cat singbox.log || true
-          echo "--- health check ---"
           if ! pgrep -f "./sing-box" > /dev/null; then
             echo "❌ sing-box process not running"
             exit 1
           fi
           echo "✅ sing-box process alive"
-          echo "--- proxy connectivity test ---"
           if ! curl -s -m 30 -x http://127.0.0.1:8080 https://api.ip.sb/ip; then
-            echo ""
-            echo "❌ proxy connect FAILED — no reachable node in pool"
+            echo "❌ proxy connect FAILED"
             exit 1
-          else
-            echo ""
-            echo "  <- proxy OK"
-            grep -iE "urltest|selected|node-" singbox.log | tail -5 || true
           fi
 
       - name: Run Renew Script
+        id: renew
+        continue-on-error: true
         env:
           USERS_JSON: ${{ secrets.USERS_JSON }}
           KATABUMP_EMAIL: ${{ secrets.KATABUMP_EMAIL }}
@@ -75,16 +65,71 @@ jobs:
           IS_PROXY: ${{ secrets.PROXY_URL != '' && 'true' || 'false' }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 main.py
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 main.py 2>&1 | tee output.log
+          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+
+      - name: Update status.json
+        if: always()
+        env:
+          EXIT_CODE: ${{ steps.renew.outputs.exit_code }}
+        run: |
+          python - <<'PY'
+          import json, os, datetime
+          from pathlib import Path
+
+          log = ""
+          if Path("output.log").exists():
+              log = Path("output.log").read_text(encoding="utf-8", errors="ignore")
+
+          exit_code = os.environ.get("EXIT_CODE", "0")
+          now = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+          lower = log.lower()
+          if "success" in lower and "renew" in lower and "can't renew" not in lower and "cannot renew" not in lower:
+              status = "success"
+          elif "can't renew" in lower or "cannot renew" in lower or "renew your server yet" in lower:
+              status = "too_early"
+          elif "invalid" in lower or "failed" in lower or "error" in lower:
+              status = "failed"
+          else:
+              status = "unknown"
+
+          p = Path("status.json")
+          data = {"updated": "", "results": []}
+          if p.exists():
+              try:
+                  data = json.loads(p.read_text(encoding="utf-8"))
+              except Exception:
+                  pass
+
+          data["updated"] = now
+          data["results"].insert(0, {
+              "time": now,
+              "status": status,
+              "exit_code": exit_code,
+              "last_lines": log.strip().splitlines()[-15:],
+          })
+          data["results"] = data["results"][:30]
+          p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+          print("status.json updated:", status)
+          PY
+
+      - name: Commit status.json
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add status.json
+          git diff --staged --quiet || git commit -m "update status $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push
 
       - name: Upload Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: renew-artifacts
+          name: renew-logs
           path: |
-            *.png
-            screenshots/
+            output.log
             singbox.log
-            config.json
           if-no-files-found: ignore
